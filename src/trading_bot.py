@@ -121,10 +121,21 @@ def format_report(result: BacktestResult) -> str:
 def main() -> None:
     """CLI entrypoint."""
     import argparse
+    import os
+    from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Quantitative trading bot backtest")
-    parser.add_argument("csv_path", help="Path to CSV file with price data")
-    parser.add_argument("--price-column", default="close", help="Column for price data")
+    parser.add_argument(
+        "csv_path",
+        type=str,
+        help="Path to CSV file with price data",
+    )
+    parser.add_argument(
+        "--price-column",
+        dest="price_column",
+        default="close",
+        help="Column for price data (default: close)",
+    )
     parser.add_argument("--fast-ema", type=int, default=12, help="Fast EMA span")
     parser.add_argument("--slow-ema", type=int, default=48, help="Slow EMA span")
     parser.add_argument("--vol-lookback", type=int, default=20, help="Volatility window")
@@ -138,6 +149,23 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    
+    # Resolve and validate the CSV path
+    # Path handles both forward and backslashes on Windows automatically
+    csv_path = Path(args.csv_path)
+    
+    # Resolve relative paths to absolute
+    if not csv_path.is_absolute():
+        csv_path = (Path.cwd() / csv_path).resolve()
+    else:
+        csv_path = csv_path.resolve()
+    
+    # Validate the path exists and is a file
+    if not csv_path.exists():
+        parser.error(f"CSV file not found: {csv_path}")
+    if not csv_path.is_file():
+        parser.error(f"Path exists but is not a file: {csv_path}")
+    
     config = StrategyConfig(
         fast_ema_span=args.fast_ema,
         slow_ema_span=args.slow_ema,
@@ -147,7 +175,7 @@ def main() -> None:
         transaction_cost_bps=args.transaction_cost_bps,
     )
 
-    result = run_backtest(args.csv_path, args.price_column, config)
+    result = run_backtest(str(csv_path), args.price_column, config)
     print(format_report(result))
 
 
