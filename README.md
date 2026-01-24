@@ -1,4 +1,4 @@
-# Quantitative Trading Bot
+# Quantitative Trading Research Framework
 
 A comprehensive quantitative trading bot with backtesting, walk-forward validation, live trading, and multi-asset portfolio support. Implements a volatility-targeted trend strategy (EMA crossover with position sizing) with risk controls and performance metrics.
 
