@@ -8,6 +8,7 @@ from src.sector_analysis import (
     SectorRecommendation,
     TickerAnalysis,
     analyze_all_sectors,
+    analyze_market_top_stocks,
     analyze_sector,
     analyze_ticker,
 )
@@ -28,7 +29,7 @@ st.sidebar.divider()
 
 mode = st.sidebar.radio(
     "View",
-    ["All Sectors", "Single Sector", "Lookup Ticker"],
+    ["All Sectors", "Top 10 Stocks", "Single Sector", "Lookup Ticker"],
     index=0,
 )
 
@@ -52,6 +53,11 @@ def _render_ticker(a: TickerAnalysis, label: str = "") -> None:
         st.markdown("---")
         st.markdown("#### Why invest?")
         st.markdown(a.reasoning)
+        st.markdown("#### Investment thesis (paragraph)")
+        st.markdown(a.investment_thesis)
+        if a.event_headlines:
+            st.markdown("#### Current events (recent headlines)")
+            st.markdown("\n".join([f"- {h}" for h in a.event_headlines]))
 
 # Main
 st.title("What to invest in — and why")
@@ -106,6 +112,39 @@ if mode == "All Sectors":
                 _render_ticker(a)
             if not rec.stock_analyses and not rec.etf_analysis:
                 st.warning("No tickers met the good-stock filter in this sector.")
+
+elif mode == "Top 10 Stocks":
+    st.subheader("Market-wide top 10 stocks")
+    st.caption(
+        "We scan the full universe of representative stocks across all sectors, "
+        "rank them by a composite score (returns, Sharpe, drawdown, trend, and event signal), "
+        "and show the top 10 with math + current-events reasoning."
+    )
+    with st.spinner("Analyzing the full market universe…"):
+        top_stocks = analyze_market_top_stocks(config=config, lookback_days=lookback, top_n=10)
+
+    if not top_stocks:
+        st.warning("No market data available. Check connectivity and try again.")
+        st.stop()
+
+    table_rows = []
+    for idx, a in enumerate(top_stocks, start=1):
+        table_rows.append(
+            {
+                "#": idx,
+                "Ticker": a.symbol,
+                "Sector": a.sector_id,
+                "Score": round(a.rank_score, 2),
+                "Trend": a.trend_signal,
+                "Ann Return": f"{a.annual_return:.1%}",
+                "Sharpe": f"{a.sharpe_ratio:.2f}",
+            }
+        )
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Top 10 breakdown")
+    for a in top_stocks:
+        _render_ticker(a, a.symbol)
 
 elif mode == "Single Sector":
     sel = st.selectbox("Select sector", sector_options)

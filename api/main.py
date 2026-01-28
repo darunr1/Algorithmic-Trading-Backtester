@@ -11,6 +11,7 @@ from src.sector_analysis import (
     SectorRecommendation,
     TickerAnalysis,
     analyze_all_sectors,
+    analyze_market_top_stocks,
     analyze_sector,
     analyze_ticker,
 )
@@ -46,10 +47,12 @@ def _ticker_to_dict(a: TickerAnalysis) -> Dict[str, Any]:
         "max_drawdown": a.max_drawdown,
         "n_observations": a.n_observations,
         "reasoning": a.reasoning,
+        "investment_thesis": a.investment_thesis,
         "is_good": a.is_good,
         "event_score": a.event_score,
         "event_headlines": list(a.event_headlines),
         "event_summary": a.event_summary,
+        "rank_score": a.rank_score,
     }
 
 
@@ -141,3 +144,14 @@ def ticker_analyze_api(
     if not a:
         raise HTTPException(status_code=404, detail="Ticker not found or insufficient data")
     return _ticker_to_dict(a)
+
+
+@app.get("/market/top-stocks")
+def market_top_stocks_api(
+    lookback_days: int = 504,
+    top_n: int = 10,
+) -> List[Dict[str, Any]]:
+    """Analyze the full stock universe and return top-ranked stocks."""
+    config = StrategyConfig()
+    analyses = analyze_market_top_stocks(config=config, lookback_days=lookback_days, top_n=top_n)
+    return [_ticker_to_dict(a) for a in analyses]

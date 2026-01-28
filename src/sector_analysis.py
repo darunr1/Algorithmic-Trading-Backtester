@@ -34,10 +34,12 @@ class TickerAnalysis:
     max_drawdown: float
     n_observations: int
     reasoning: str
+    investment_thesis: str
     is_good: bool
     event_score: float
     event_headlines: List[str] = field(default_factory=list)
     event_summary: str = ""
+    rank_score: float = 0.0
     raw_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -197,9 +199,11 @@ def _analyze_ticker(
             max_drawdown=0.0,
             n_observations=len(prices),
             reasoning="Insufficient data for analysis.",
+            investment_thesis="Not enough data to form a reliable investment thesis.",
             is_good=False,
             event_score=0.0,
             event_summary="No recent headlines available.",
+            rank_score=0.0,
         )
 
     fast_ema = prices.ewm(span=config.fast_ema_span, adjust=False).mean()
@@ -239,6 +243,28 @@ def _analyze_ticker(
         event_score=event_score,
         has_headlines=bool(headlines),
     )
+    rank_score = _market_rank_score(
+        annual_return=ann_ret,
+        sharpe=sharpe,
+        max_drawdown=mdd,
+        event_score=event_score,
+        trend=trend,
+    )
+    investment_thesis = _build_investment_thesis(
+        symbol=symbol,
+        trend=trend,
+        fast_ema=fe,
+        slow_ema=se,
+        annual_return=ann_ret,
+        sharpe=sharpe,
+        annual_volatility=ann_vol,
+        max_drawdown=mdd,
+        position_size=pos,
+        target_vol=config.target_vol,
+        n_days=len(prices),
+        event_summary=event_summary,
+        rank_score=rank_score,
+    )
     # Mathematical reasoning
     reason_parts = [
         f"**Price & trend:** Latest close = ${prices.iloc[-1]:.2f}. "
@@ -250,6 +276,7 @@ def _analyze_ticker(
         f"Sharpe = {sharpe:.2f}, Max drawdown = {mdd:.1%}. "
         f"Transaction costs = {config.transaction_cost_bps} bps.",
         f"**Real-world catalysts:** {event_summary}",
+        f"**Investment thesis (paragraph):** {investment_thesis}",
     ]
     if is_good:
         reason_parts.append(
@@ -284,17 +311,68 @@ def _analyze_ticker(
         max_drawdown=mdd,
         n_observations=len(prices),
         reasoning=reasoning,
+        investment_thesis=investment_thesis,
         is_good=is_good,
         event_score=event_score,
         event_headlines=headlines,
         event_summary=event_summary,
+        rank_score=rank_score,
         raw_metrics={
             "annual_return": ann_ret,
             "sharpe_ratio": sharpe,
             "annual_volatility": ann_vol,
             "max_drawdown": mdd,
             "event_score": event_score,
+            "rank_score": rank_score,
         },
+    )
+
+
+def _market_rank_score(
+    annual_return: float,
+    sharpe: float,
+    max_drawdown: float,
+    event_score: float,
+    trend: str,
+) -> float:
+    """Composite score for ranking across the full market universe."""
+    trend_bonus = 0.25 if trend == "bullish" else -0.25
+    return (
+        (annual_return * 3.0)
+        + (sharpe * 1.5)
+        + (event_score * 0.5)
+        + (max_drawdown * 0.5)
+        + trend_bonus
+    )
+
+
+def _build_investment_thesis(
+    symbol: str,
+    trend: str,
+    fast_ema: float,
+    slow_ema: float,
+    annual_return: float,
+    sharpe: float,
+    annual_volatility: float,
+    max_drawdown: float,
+    position_size: float,
+    target_vol: float,
+    n_days: int,
+    event_summary: str,
+    rank_score: float,
+) -> str:
+    """Create a narrative paragraph that blends math with real-world events."""
+    trend_phrase = "uptrend" if trend == "bullish" else "downtrend"
+    return (
+        f"{symbol} is currently in a {trend_phrase}, with a fast EMA ({fast_ema:.2f}) "
+        f"{'above' if trend == 'bullish' else 'below'} the slow EMA ({slow_ema:.2f}). "
+        f"Over roughly {n_days} trading days, the strategy produces an annualized return of "
+        f"{annual_return:.1%} with a Sharpe ratio of {sharpe:.2f}, implying "
+        f"{annual_volatility:.1%} annualized volatility and a max drawdown of {max_drawdown:.1%}. "
+        f"The volatility-targeting model suggests a {position_size:.2f}x position size versus a "
+        f"{target_vol:.0%} risk target, indicating how much exposure the math supports. "
+        f"Current events: {event_summary} This real-world backdrop, combined with a composite "
+        f"market score of {rank_score:.2f}, supports the case for investment if the trend persists."
     )
 
 
@@ -356,6 +434,29 @@ def analyze_all_sectors(
             continue
     results.sort(key=lambda r: r.sector_score, reverse=True)
     return results
+
+
+def analyze_market_top_stocks(
+    config: Optional[StrategyConfig] = None,
+    lookback_days: int = 504,
+    top_n: int = 10,
+) -> List[TickerAnalysis]:
+    """Analyze the full stock universe and return top-ranked stocks."""
+    config = config or StrategyConfig()
+    from src.sectors import get_all_stocks, get_sector_for_symbol
+
+    analyses: List[TickerAnalysis] = []
+    for symbol in get_all_stocks():
+        prices = _fetch_prices(symbol, lookback_days)
+        if prices is None:
+            continue
+        sector = get_sector_for_symbol(symbol)
+        sector_id = sector.id if sector else "market"
+        analysis = _analyze_ticker(symbol, sector_id, False, config, prices)
+        analyses.append(analysis)
+
+    analyses.sort(key=lambda a: a.rank_score, reverse=True)
+    return analyses[:top_n]
 
 
 def analyze_ticker(

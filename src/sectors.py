@@ -107,6 +107,14 @@ def get_sector(sector_id: str) -> Sector | None:
     return None
 
 
+def get_sector_for_symbol(symbol: str) -> Sector | None:
+    """Return sector that contains the symbol (ETF or stock)."""
+    for s in SECTORS:
+        if symbol == s.etf or symbol in s.stocks:
+            return s
+    return None
+
+
 def get_all_tickers() -> List[str]:
     """All unique tickers (ETFs + stocks) across sectors."""
     seen = set()
@@ -115,6 +123,18 @@ def get_all_tickers() -> List[str]:
         if s.etf not in seen:
             seen.add(s.etf)
             out.append(s.etf)
+        for t in s.stocks:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+
+def get_all_stocks() -> List[str]:
+    """All unique stock tickers across sectors (exclude ETFs)."""
+    seen = set()
+    out: List[str] = []
+    for s in SECTORS:
         for t in s.stocks:
             if t not in seen:
                 seen.add(t)
