@@ -78,15 +78,13 @@ if mode == "All Sectors":
 
     rows = []
     for r in recs:
-        n_bull = sum(1 for a in r.stock_analyses if a.trend_signal == "bullish")
-        if r.etf_analysis and r.etf_analysis.trend_signal == "bullish":
-            n_bull += 1
-        n_tot = len(r.stock_analyses) + (1 if r.etf_analysis else 0)
+        n_good = len(r.stock_analyses) + (1 if r.etf_analysis else 0)
+        n_tot = len(r.sector.stocks) + 1
         rows.append({
             "Sector": r.sector.name,
             "ETF": r.sector.etf,
             "Score": round(r.sector_score, 2),
-            "Bullish": f"{n_bull}/{n_tot}",
+            "Good tickers": f"{n_good}/{n_tot}",
             "Reasoning": r.reasoning[:120] + "…" if len(r.reasoning) > 120 else r.reasoning,
         })
 
@@ -106,6 +104,8 @@ if mode == "All Sectors":
                 _render_ticker(rec.etf_analysis, f"{rec.sector.etf} (ETF)")
             for a in rec.stock_analyses:
                 _render_ticker(a)
+            if not rec.stock_analyses and not rec.etf_analysis:
+                st.warning("No tickers met the good-stock filter in this sector.")
 
 elif mode == "Single Sector":
     sel = st.selectbox("Select sector", sector_options)
@@ -129,12 +129,13 @@ elif mode == "Single Sector":
     if rec.etf_analysis:
         _render_ticker(rec.etf_analysis, f"{rec.sector.etf}")
     else:
-        st.warning(f"Could not analyze {rec.sector.etf}.")
+        st.warning(f"{rec.sector.etf} did not meet the good-stock filter or data was unavailable.")
 
     st.markdown("#### Stocks")
     for a in rec.stock_analyses:
         _render_ticker(a)
-
+    if not rec.stock_analyses and not rec.etf_analysis:
+        st.warning("No tickers met the good-stock filter in this sector.")
 else:
     # Lookup Ticker
     sym = st.text_input("Ticker symbol", value="AAPL", max_chars=10).strip().upper()

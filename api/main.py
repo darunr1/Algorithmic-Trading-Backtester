@@ -46,6 +46,10 @@ def _ticker_to_dict(a: TickerAnalysis) -> Dict[str, Any]:
         "max_drawdown": a.max_drawdown,
         "n_observations": a.n_observations,
         "reasoning": a.reasoning,
+        "is_good": a.is_good,
+        "event_score": a.event_score,
+        "event_headlines": list(a.event_headlines),
+        "event_summary": a.event_summary,
     }
 
 

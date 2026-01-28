@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -20,7 +20,6 @@ from src.trading_bot import (
 @dataclass
 class TickerAnalysis:
     """Analysis result for a single ticker."""
-
     symbol: str
     sector_id: str
     is_etf: bool
@@ -35,6 +34,10 @@ class TickerAnalysis:
     max_drawdown: float
     n_observations: int
     reasoning: str
+    is_good: bool
+    event_score: float
+    event_headlines: List[str] = field(default_factory=list)
+    event_summary: str = ""
     raw_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -63,6 +66,111 @@ def _fetch_prices(symbol: str, lookback_days: int = 504) -> Optional[pd.Series]:
         return None
     return df["Close"].dropna()
 
+def _fetch_recent_headlines(
+    symbol: str,
+    lookback_days: int = 14,
+    max_items: int = 5,
+) -> List[str]:
+    """Fetch recent headlines for a symbol from Yahoo Finance."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise ImportError("yfinance is required. Install with: pip install yfinance")
+    ticker = yf.Ticker(symbol)
+    news_items = getattr(ticker, "news", None)
+    if not news_items:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    headlines: List[str] = []
+    for item in news_items:
+        if len(headlines) >= max_items:
+            break
+        title = item.get("title")
+        published = item.get("providerPublishTime")
+        if not title:
+            continue
+        if published:
+            published_dt = datetime.fromtimestamp(published, tz=timezone.utc)
+            if published_dt < cutoff:
+                continue
+        headlines.append(str(title))
+    return headlines
+
+
+def _score_event_headlines(headlines: List[str]) -> float:
+    """Score headlines using simple keyword polarity."""
+    if not headlines:
+        return 0.0
+    positives = {
+        "beats",
+        "beat",
+        "surge",
+        "record",
+        "raises",
+        "raise",
+        "upgrade",
+        "upgraded",
+        "win",
+        "wins",
+        "contract",
+        "approval",
+        "approves",
+        "launch",
+        "partnership",
+        "acquire",
+        "acquisition",
+        "guidance raise",
+        "buyback",
+    }
+    negatives = {
+        "miss",
+        "misses",
+        "downgrade",
+        "downgraded",
+        "lawsuit",
+        "recall",
+        "probe",
+        "decline",
+        "cuts",
+        "cut",
+        "warning",
+        "fraud",
+    }
+    score = 0
+    for headline in headlines:
+        text = headline.lower()
+        pos_hits = sum(1 for word in positives if word in text)
+        neg_hits = sum(1 for word in negatives if word in text)
+        score += pos_hits - neg_hits
+    return score / max(len(headlines), 1)
+
+
+def _summarize_events(headlines: List[str], score: float) -> str:
+    if not headlines:
+        return "No recent headlines available."
+    label = "positive" if score > 0 else "mixed" if score == 0 else "negative"
+    headline_list = "; ".join(headlines[:3])
+    return f"Recent headlines are {label}: {headline_list}."
+
+
+def _is_good_ticker(
+    trend: str,
+    sharpe: float,
+    ann_ret: float,
+    max_drawdown: float,
+    event_score: float,
+    has_headlines: bool,
+) -> bool:
+    if trend != "bullish":
+        return False
+    if sharpe < 0.5 or ann_ret <= 0:
+        return False
+    if max_drawdown < -0.35:
+        return False
+    if has_headlines and event_score < 0:
+        return False
+    return True
+
 
 def _analyze_ticker(
     symbol: str,
@@ -89,6 +197,9 @@ def _analyze_ticker(
             max_drawdown=0.0,
             n_observations=len(prices),
             reasoning="Insufficient data for analysis.",
+            is_good=False,
+            event_score=0.0,
+            event_summary="No recent headlines available.",
         )
 
     fast_ema = prices.ewm(span=config.fast_ema_span, adjust=False).mean()
@@ -114,6 +225,20 @@ def _analyze_ticker(
     ann_vol = perf.annual_volatility
     mdd = perf.max_drawdown
 
+    try:
+        headlines = _fetch_recent_headlines(symbol)
+    except Exception:
+        headlines = []
+    event_score = _score_event_headlines(headlines)
+    event_summary = _summarize_events(headlines, event_score)
+    is_good = _is_good_ticker(
+        trend=trend,
+        sharpe=sharpe,
+        ann_ret=ann_ret,
+        max_drawdown=mdd,
+        event_score=event_score,
+        has_headlines=bool(headlines),
+    )
     # Mathematical reasoning
     reason_parts = [
         f"**Price & trend:** Latest close = ${prices.iloc[-1]:.2f}. "
@@ -124,10 +249,12 @@ def _analyze_ticker(
         f"**Backtest (≈{len(prices)} days):** Annual return = {ann_ret:.1%}, "
         f"Sharpe = {sharpe:.2f}, Max drawdown = {mdd:.1%}. "
         f"Transaction costs = {config.transaction_cost_bps} bps.",
+        f"**Real-world catalysts:** {event_summary}",
     ]
-    if sharpe > 0.5 and ann_ret > 0:
+    if is_good:
         reason_parts.append(
-            f"**Recommendation:** Favorable risk-adjusted profile (Sharpe > 0.5, positive return). "
+            "**Recommendation:** Good-stock filter passed (bullish trend, positive return, "
+            "Sharpe ≥ 0.5, drawdown within limits, and no negative news skew). "
             f"Consider exposure if trend remains {trend}."
         )
     elif trend == "bearish":
@@ -157,11 +284,16 @@ def _analyze_ticker(
         max_drawdown=mdd,
         n_observations=len(prices),
         reasoning=reasoning,
+        is_good=is_good,
+        event_score=event_score,
+        event_headlines=headlines,
+        event_summary=event_summary,
         raw_metrics={
             "annual_return": ann_ret,
             "sharpe_ratio": sharpe,
             "annual_volatility": ann_vol,
             "max_drawdown": mdd,
+            "event_score": event_score,
         },
     )
 
@@ -178,35 +310,32 @@ def analyze_sector(
     # ETF
     etf_prices = _fetch_prices(sector.etf, lookback_days)
     if etf_prices is not None:
-        rec.etf_analysis = _analyze_ticker(
-            sector.etf, sector.id, True, config, etf_prices
-        )
+        etf_analysis = _analyze_ticker(sector.etf, sector.id, True, config, etf_prices)
+        rec.etf_analysis = etf_analysis if etf_analysis.is_good else None
 
     # Stocks
     for sym in sector.stocks:
         prices = _fetch_prices(sym, lookback_days)
         if prices is not None:
-            rec.stock_analyses.append(
-                _analyze_ticker(sym, sector.id, False, config, prices)
-            )
+            analysis = _analyze_ticker(sym, sector.id, False, config, prices)
+            if analysis.is_good:
+                rec.stock_analyses.append(analysis)
 
-    # Sector score: avg Sharpe of ETF + stocks (bullish only, else 0)
+    # Sector score: avg Sharpe of good tickers
     sharpes: List[float] = []
-    if rec.etf_analysis and rec.etf_analysis.trend_signal == "bullish":
+    if rec.etf_analysis:
         sharpes.append(rec.etf_analysis.sharpe_ratio)
-    for a in rec.stock_analyses:
-        if a.trend_signal == "bullish":
-            sharpes.append(a.sharpe_ratio)
+    sharpes.extend(a.sharpe_ratio for a in rec.stock_analyses)
     rec.sector_score = float(np.mean(sharpes)) if sharpes else 0.0
 
     # Sector-level reasoning
-    n_bull = sum(1 for a in rec.stock_analyses if a.trend_signal == "bullish")
-    if rec.etf_analysis and rec.etf_analysis.trend_signal == "bullish":
-        n_bull += 1
-    n_total = len(rec.stock_analyses) + (1 if rec.etf_analysis else 0)
+    n_good = len(rec.stock_analyses) + (1 if rec.etf_analysis else 0)
+    n_total = len(sector.stocks) + 1
     rec.reasoning = (
-        f"**{sector.name}** ({sector.etf}): {n_bull}/{n_total} tickers bullish. "
-        f"Sector score (avg Sharpe, bullish only) = {rec.sector_score:.2f}. "
+        f"**{sector.name}** ({sector.etf}): {n_good}/{n_total} tickers pass the "
+        "good-stock filter (bullish + positive return + Sharpe ≥ 0.5 + "
+        "drawdown limits + non-negative news skew). "
+        f"Sector score (avg Sharpe, good only) = {rec.sector_score:.2f}. "
         f"{sector.description}"
     )
 
