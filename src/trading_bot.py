@@ -16,6 +16,19 @@ class StrategyConfig:
     max_leverage: float = 2.0
     transaction_cost_bps: float = 1.0
 
+    # New Indicators
+    rsi_period: int = 14
+    rsi_overbought: float = 70.0
+    rsi_oversold: float = 30.0
+    bb_period: int = 20
+    bb_std: float = 2.0
+
+    # Risk Management
+    stop_loss_pct: Optional[float] = 0.05  # 5% stop loss
+    take_profit_pct: Optional[float] = 0.10 # 10% take profit
+    drawdown_limit_pct: float = 0.20        # 20% drawdown limit
+    drawdown_risk_scaling: bool = True     # Scale down exposure during drawdown
+
 
 @dataclass(frozen=True)
 class BacktestResult:
@@ -47,19 +60,56 @@ def compute_strategy_returns(
     prices: pd.Series,
     config: StrategyConfig,
 ) -> pd.Series:
-    """Compute daily strategy returns with volatility targeting and costs."""
+    """Compute daily strategy returns with volatility targeting, costs, and risk management."""
+    # 1. EMA Trend Signal
     fast_ema = prices.ewm(span=config.fast_ema_span, adjust=False).mean()
     slow_ema = prices.ewm(span=config.slow_ema_span, adjust=False).mean()
     trend_signal = (fast_ema > slow_ema).astype(float)
 
+    # 2. RSI Signal (Mean Reversion Overlay)
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=config.rsi_period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=config.rsi_period).mean()
+    rs = gain / loss.replace(0.0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    
+    # RSI filters trend signal: don't go long if overbought, don't stay short if oversold
+    rsi_multiplier = pd.Series(1.0, index=prices.index)
+    rsi_multiplier[rsi > config.rsi_overbought] = 0.5  # Scale down if overbought
+    rsi_multiplier[rsi < config.rsi_oversold] = 1.0   # Full signal if oversold (could even increase)
+    
+    # 3. Bollinger Bands Signal
+    bb_mid = prices.rolling(window=config.bb_period).mean()
+    bb_std = prices.rolling(window=config.bb_period).std()
+    bb_upper = bb_mid + (config.bb_std * bb_std)
+    bb_lower = bb_mid - (config.bb_std * bb_std)
+    
+    # Simple BB strategy: Scale down trend if price is outside bands
+    bb_multiplier = pd.Series(1.0, index=prices.index)
+    bb_multiplier[prices > bb_upper] = 0.5
+    bb_multiplier[prices < bb_lower] = 0.5
+
+    # 4. Volatility Targeting
     daily_returns = prices.pct_change().fillna(0.0)
     rolling_vol = daily_returns.rolling(config.vol_lookback).std().replace(0.0, pd.NA)
     vol_target = config.target_vol / (rolling_vol * (252**0.5))
     position_size = vol_target.clip(upper=config.max_leverage).fillna(0.0)
 
-    raw_position = trend_signal * position_size
-    position = raw_position.shift(1).fillna(0.0)
+    # 5. Drawdown Risk Scaling
+    if config.drawdown_risk_scaling:
+        equity_curve = (1 + daily_returns).cumprod() # Simple asset equity for scaling
+        rolling_max = equity_curve.cummax()
+        drawdown = (equity_curve - rolling_max) / rolling_max
+        # Scale down if drawdown exceeds half the limit
+        dd_multiplier = (1.0 - (drawdown.abs() / config.drawdown_limit_pct)).clip(lower=0.0, upper=1.0)
+    else:
+        dd_multiplier = 1.0
 
+    # Combined Signal & Position
+    raw_signal = trend_signal * rsi_multiplier * bb_multiplier * dd_multiplier
+    position = (raw_signal * position_size).shift(1).fillna(0.0)
+
+    # 6. Transaction Costs
     turnover = position.diff().abs().fillna(0.0)
     transaction_cost = turnover * (config.transaction_cost_bps / 10_000)
 
@@ -131,7 +181,7 @@ def main() -> None:
     # Mode selection
     parser.add_argument(
         "--mode",
-        choices=["backtest", "walk-forward", "live", "portfolio"],
+        choices=["backtest", "walk-forward", "live", "portfolio", "download"],
         default="backtest",
         help="Trading mode (default: backtest)",
     )
@@ -152,8 +202,7 @@ def main() -> None:
     parser.add_argument(
         "--data-source",
         choices=["csv", "alpaca", "yahoo"],
-        default="csv",
-        help="Data source type (default: csv)",
+        help="Data source type (default: csv if path provided, yahoo if symbol provided)",
     )
 
     # Live trading arguments
@@ -187,12 +236,22 @@ def main() -> None:
     parser.add_argument("--vol-lookback", type=int, default=20, help="Volatility window")
     parser.add_argument("--target-vol", type=float, default=0.15, help="Target volatility")
     parser.add_argument("--max-leverage", type=float, default=2.0, help="Max leverage")
-    parser.add_argument(
-        "--transaction-cost-bps",
-        type=float,
-        default=1.0,
-        help="Transaction cost in basis points",
-    )
+    parser.add_argument("--transaction-cost-bps", type=float, default=1.0, help="Transaction cost (basis points)")
+    
+    # New strategy parameters
+    parser.add_argument("--rsi-period", type=int, default=14, help="RSI lookback period")
+    parser.add_argument("--rsi-overbought", type=float, default=70.0, help="RSI overbought threshold")
+    parser.add_argument("--rsi-oversold", type=float, default=30.0, help="RSI oversold threshold")
+    parser.add_argument("--bb-period", type=int, default=20, help="Bollinger Bands period")
+    parser.add_argument("--bb-std", type=float, default=2.0, help="Bollinger Bands standard deviations")
+    parser.add_argument("--stop-loss", type=float, help="Stop loss percentage (e.g., 0.05 for 5%%)")
+    parser.add_argument("--take-profit", type=float, help="Take profit percentage")
+    parser.add_argument("--drawdown-limit", type=float, default=0.20, help="Drawdown limit for risk scaling")
+    parser.add_argument("--no-risk-scaling", action="store_false", dest="risk_scaling", help="Disable drawdown risk scaling")
+    parser.set_defaults(risk_scaling=True)
+
+    # Output options
+    parser.add_argument("--save-data", type=str, help="Save fetched historical data to this CSV path")
 
     # Walk-forward arguments
     parser.add_argument(
@@ -216,6 +275,13 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Set default data source based on provided arguments
+    if args.data_source is None:
+        if args.symbol:
+            args.data_source = "yahoo"
+        else:
+            args.data_source = "csv"
+
     config = StrategyConfig(
         fast_ema_span=args.fast_ema,
         slow_ema_span=args.slow_ema,
@@ -223,34 +289,92 @@ def main() -> None:
         target_vol=args.target_vol,
         max_leverage=args.max_leverage,
         transaction_cost_bps=args.transaction_cost_bps,
+        rsi_period=args.rsi_period,
+        rsi_overbought=args.rsi_overbought,
+        rsi_oversold=args.rsi_oversold,
+        bb_period=args.bb_period,
+        bb_std=args.bb_std,
+        stop_loss_pct=args.stop_loss,
+        take_profit_pct=args.take_profit,
+        drawdown_limit_pct=args.drawdown_limit,
+        drawdown_risk_scaling=args.risk_scaling,
     )
 
     # Route to appropriate mode
     if args.mode == "backtest":
-        if not args.csv_path:
-            parser.error("csv_path is required for backtest mode")
-        csv_path = Path(args.csv_path)
-        if not csv_path.is_absolute():
-            csv_path = (Path.cwd() / csv_path).resolve()
+        data = None
+        if args.csv_path:
+            csv_path = Path(args.csv_path)
+            if not csv_path.is_absolute():
+                csv_path = (Path.cwd() / csv_path).resolve()
+            if not csv_path.exists():
+                parser.error(f"CSV file not found: {csv_path}")
+            data = load_price_data(str(csv_path), args.price_column)
+        elif args.symbol:
+            from src.data_source import YahooFinanceDataSource, AlpacaDataSource
+            from datetime import datetime, timedelta
+            
+            print(f"Fetching historical data for {args.symbol} from {args.data_source}...")
+            if args.data_source == "yahoo":
+                source = YahooFinanceDataSource()
+            elif args.data_source == "alpaca":
+                if not args.alpaca_key or not args.alpaca_secret:
+                    parser.error("--alpaca-key and --alpaca-secret required for Alpaca data source")
+                source = AlpacaDataSource(args.alpaca_key, args.alpaca_secret)
+            else:
+                parser.error("Must provide csv_path or use a remote data source with --symbol")
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365 * 2) # Default 2 years
+            data = source.get_historical_data(args.symbol, start_date, end_date)
+            data = data.set_index("date")
         else:
-            csv_path = csv_path.resolve()
-        if not csv_path.exists():
-            parser.error(f"CSV file not found: {csv_path}")
-        result = run_backtest(str(csv_path), args.price_column, config)
+            parser.error("Either csv_path or --symbol is required for backtest mode")
+
+        if args.save_data and data is not None:
+            data.to_csv(args.save_data)
+            print(f"Data saved to {args.save_data}")
+
+        prices = data[args.price_column.lower()].astype(float)
+        strategy_returns = compute_strategy_returns(prices, config)
+        result = calculate_performance(strategy_returns)
         print(format_report(result))
 
     elif args.mode == "walk-forward":
-        if not args.csv_path:
-            parser.error("csv_path is required for walk-forward mode")
+        data = None
+        if args.csv_path:
+            csv_path = Path(args.csv_path)
+            if not csv_path.is_absolute():
+                csv_path = (Path.cwd() / csv_path).resolve()
+            if not csv_path.exists():
+                parser.error(f"CSV file not found: {csv_path}")
+            data = load_price_data(str(csv_path), args.price_column)
+        elif args.symbol:
+            from src.data_source import YahooFinanceDataSource, AlpacaDataSource
+            from datetime import datetime, timedelta
+            
+            print(f"Fetching historical data for {args.symbol} from {args.data_source}...")
+            if args.data_source == "yahoo":
+                source = YahooFinanceDataSource()
+            elif args.data_source == "alpaca":
+                if not args.alpaca_key or not args.alpaca_secret:
+                    parser.error("--alpaca-key and --alpaca-secret required for Alpaca data source")
+                source = AlpacaDataSource(args.alpaca_key, args.alpaca_secret)
+            else:
+                parser.error("Must provide csv_path or use a remote data source with --symbol")
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365 * 2)
+            data = source.get_historical_data(args.symbol, start_date, end_date)
+            data = data.set_index("date")
+        else:
+            parser.error("Either csv_path or --symbol is required for walk-forward mode")
+
+        if args.save_data and data is not None:
+            data.to_csv(args.save_data)
+            print(f"Data saved to {args.save_data}")
+
         from src.walk_forward import run_walk_forward
-
-        csv_path = Path(args.csv_path)
-        if not csv_path.is_absolute():
-            csv_path = (Path.cwd() / csv_path).resolve()
-        if not csv_path.exists():
-            parser.error(f"CSV file not found: {csv_path}")
-
-        data = load_price_data(str(csv_path), args.price_column)
         prices = data[args.price_column.lower()].astype(float)
 
         wf_result = run_walk_forward(
@@ -261,6 +385,29 @@ def main() -> None:
             step_days=args.step_days,
         )
         print(wf_result.get_summary())
+
+    elif args.mode == "download":
+        if not args.symbol:
+            parser.error("--symbol is required for download mode")
+        
+        from src.data_source import YahooFinanceDataSource, AlpacaDataSource
+        from datetime import datetime, timedelta
+        
+        print(f"Downloading data for {args.symbol} from {args.data_source}...")
+        if args.data_source == "yahoo":
+            source = YahooFinanceDataSource()
+        elif args.data_source == "alpaca":
+            if not args.alpaca_key or not args.alpaca_secret:
+                parser.error("--alpaca-key and --alpaca-secret required for Alpaca data source")
+            source = AlpacaDataSource(args.alpaca_key, args.alpaca_secret)
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365 * 5) # Default 5 years for downloads
+        data = source.get_historical_data(args.symbol, start_date, end_date)
+        
+        save_path = args.save_data or f"{args.symbol}_data.csv"
+        data.to_csv(save_path, index=False)
+        print(f"Successfully downloaded and saved data to {save_path}")
 
     elif args.mode == "live":
         if not args.symbol:

@@ -54,65 +54,52 @@ def compute_portfolio_returns(
     prices: pd.DataFrame,
     config: PortfolioConfig,
 ) -> pd.Series:
-    """Compute portfolio returns for multiple assets.
-
-    Args:
-        prices: DataFrame with prices (columns = symbols, index = dates)
-        config: Portfolio configuration
-
-    Returns:
-        Series with portfolio returns
-    """
-    # Compute individual strategy returns for each asset
-    asset_returns = {}
+    """Compute portfolio returns for multiple assets (Vectorized)."""
+    # 1. Compute individual strategy returns for each asset
+    asset_returns_dict = {}
     for symbol in config.symbols:
         if symbol not in prices.columns:
             continue
         asset_prices = prices[symbol].dropna()
         if len(asset_prices) == 0:
             continue
-        asset_returns[symbol] = compute_strategy_returns(
+        asset_returns_dict[symbol] = compute_strategy_returns(
             asset_prices, config.strategy_config
         )
 
-    if not asset_returns:
+    if not asset_returns_dict:
         return pd.Series(dtype=float)
 
-    # Align all returns to common index
-    returns_df = pd.DataFrame(asset_returns)
-    returns_df = returns_df.fillna(0.0)
-
-    # Compute risk parity weights
-    # Use rolling window for dynamic weights
+    returns_df = pd.DataFrame(asset_returns_dict).fillna(0.0)
     lookback = config.strategy_config.vol_lookback
-    portfolio_returns = pd.Series(index=returns_df.index, dtype=float)
-    historical_portfolio_returns = []
 
-    for i in range(len(returns_df)):
-        if i < lookback:
-            # Use equal weights initially
-            weights = pd.Series(1.0 / len(returns_df.columns), index=returns_df.columns)
-        else:
-            # Compute weights based on recent volatility
-            recent_returns = returns_df.iloc[max(0, i - lookback):i]
-            weights = compute_risk_parity_weights(
-                recent_returns, config.risk_parity_method
-            )
+    # 2. Compute dynamic weights (Risk Parity or Inverse Vol)
+    if config.risk_parity_method == "inverse_vol":
+        # Vectorized rolling volatility
+        vols = returns_df.rolling(window=lookback).std()
+        inv_vols = 1.0 / vols.replace(0.0, np.inf)
+        weights = inv_vols.div(inv_vols.sum(axis=1), axis=0)
+    else:  # equal_risk (simplified to inverse vol here)
+        vols = returns_df.rolling(window=lookback).std()
+        inv_vols = 1.0 / vols.replace(0.0, np.inf)
+        weights = inv_vols.div(inv_vols.sum(axis=1), axis=0)
 
-        # Apply portfolio volatility targeting based on historical portfolio returns
-        if i >= lookback and len(historical_portfolio_returns) >= lookback:
-            portfolio_vol = np.std(historical_portfolio_returns[-lookback:]) * np.sqrt(252)
-            if portfolio_vol > 0:
-                vol_scale = config.target_portfolio_vol / portfolio_vol
-                weights = weights * min(vol_scale, config.strategy_config.max_leverage)
+    weights = weights.fillna(1.0 / len(returns_df.columns))
 
-        # Normalize weights
-        weights = weights / weights.sum() if weights.sum() > 0 else weights
+    # 3. Portfolio Volatility Targeting
+    # Compute unscaled portfolio returns first to estimate portfolio vol
+    unscaled_port_returns = (returns_df * weights).sum(axis=1)
+    port_vol = unscaled_port_returns.rolling(window=lookback).std() * np.sqrt(252)
+    
+    vol_scale = (config.target_portfolio_vol / port_vol.replace(0.0, np.inf)).clip(
+        upper=config.strategy_config.max_leverage
+    )
+    
+    # Final scaled weights
+    final_weights = weights.multiply(vol_scale, axis=0).fillna(0.0)
 
-        # Compute weighted portfolio return
-        portfolio_return = (returns_df.iloc[i] * weights).sum()
-        portfolio_returns.iloc[i] = portfolio_return
-        historical_portfolio_returns.append(portfolio_return)
+    # 4. Final Vectorized Portfolio Returns
+    portfolio_returns = (returns_df * final_weights.shift(1)).sum(axis=1)
 
     return portfolio_returns
 

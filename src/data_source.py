@@ -61,15 +61,11 @@ class CSVDataSource(DataSource):
     """CSV file-based data source for backtesting."""
 
     def __init__(self, csv_path: str, price_column: str = "close"):
-        """Initialize CSV data source.
-
-        Args:
-            csv_path: Path to CSV file
-            price_column: Column name for price data
-        """
+        """Initialize CSV data source."""
         self.csv_path = csv_path
         self.price_column = price_column
         self._data: Optional[pd.DataFrame] = None
+        self._cache: dict[str, pd.DataFrame] = {}
         self._load_data()
 
     def _load_data(self) -> None:
@@ -92,10 +88,16 @@ class CSVDataSource(DataSource):
         interval: str = "1d",
     ) -> pd.DataFrame:
         """Get historical data from CSV."""
+        cache_key = f"{symbol}_{start_date.isoformat()}_{end_date.isoformat()}_{interval}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         if self._data is None:
             self._load_data()
         mask = (self._data.index >= start_date) & (self._data.index <= end_date)
-        return self._data[mask].reset_index()
+        result = self._data[mask].reset_index()
+        self._cache[cache_key] = result
+        return result
 
     def get_latest_price(self, symbol: str) -> float:
         """Get latest price from CSV."""
@@ -119,17 +121,9 @@ class AlpacaDataSource(DataSource):
         api_secret: str,
         base_url: Optional[str] = None,
     ):
-        """Initialize Alpaca data source.
-
-        Args:
-            api_key: Alpaca API key
-            api_secret: Alpaca API secret
-            base_url: Base URL (defaults to paper trading URL)
-        """
+        """Initialize Alpaca data source."""
         try:
             from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
             from alpaca.trading.client import TradingClient
         except ImportError:
             raise ImportError(
@@ -144,6 +138,7 @@ class AlpacaDataSource(DataSource):
             api_key, api_secret, base_url=base_url
         )
         self.trading_client = TradingClient(api_key, api_secret, paper=True)
+        self._cache: dict[str, pd.DataFrame] = {}
 
     def get_historical_data(
         self,
@@ -152,11 +147,14 @@ class AlpacaDataSource(DataSource):
         end_date: datetime,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        """Fetch historical data from Alpaca."""
+        """Fetch historical data from Alpaca with caching."""
+        cache_key = f"{symbol}_{start_date.isoformat()}_{end_date.isoformat()}_{interval}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
-        # Map interval string to TimeFrame
         timeframe_map = {
             "1d": TimeFrame.Day,
             "1h": TimeFrame.Hour,
@@ -175,10 +173,12 @@ class AlpacaDataSource(DataSource):
         df = df.rename(
             columns={
                 "timestamp": "date",
-                "trade_count": "volume",  # Alpaca uses trade_count
+                "trade_count": "volume",
             }
         )
-        return df[["date", "open", "high", "low", "close", "volume"]]
+        result = df[["date", "open", "high", "low", "close", "volume"]]
+        self._cache[cache_key] = result
+        return result
 
     def get_latest_price(self, symbol: str) -> float:
         """Get latest price from Alpaca."""
@@ -218,6 +218,7 @@ class YahooFinanceDataSource(DataSource):
                 "yfinance is required. Install with: pip install yfinance"
             )
         self.yf = yf
+        self._cache: dict[str, pd.DataFrame] = {}
 
     def get_historical_data(
         self,
@@ -226,13 +227,17 @@ class YahooFinanceDataSource(DataSource):
         end_date: datetime,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        """Fetch historical data from Yahoo Finance."""
+        """Fetch historical data from Yahoo Finance with caching."""
+        cache_key = f"{symbol}_{start_date.isoformat()}_{end_date.isoformat()}_{interval}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         ticker = self.yf.Ticker(symbol)
         df = ticker.history(start=start_date, end=end_date, interval=interval)
         df = df.reset_index()
         df = df.rename(columns={"Date": "date"})
         df["date"] = pd.to_datetime(df["date"], utc=True)
-        return df[["date", "Open", "High", "Low", "Close", "Volume"]].rename(
+        result = df[["date", "Open", "High", "Low", "Close", "Volume"]].rename(
             columns={
                 "Open": "open",
                 "High": "high",
@@ -241,6 +246,8 @@ class YahooFinanceDataSource(DataSource):
                 "Volume": "volume",
             }
         )
+        self._cache[cache_key] = result
+        return result
 
     def get_latest_price(self, symbol: str) -> float:
         """Get latest price from Yahoo Finance."""
